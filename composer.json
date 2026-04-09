@@ -1,5 +1,5 @@
 {
-	"name": "pezweb/license-client",
+	"name": "pw/license-client",
 	"description": "PezWeb license validation client for WordPress plugins",
 	"type": "library",
 	"license": "GPL-2.0-or-later",
