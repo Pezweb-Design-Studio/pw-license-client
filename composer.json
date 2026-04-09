@@ -1,0 +1,20 @@
+{
+	"name": "pezweb/license-client",
+	"description": "PezWeb license validation client for WordPress plugins",
+	"type": "library",
+	"license": "GPL-2.0-or-later",
+	"require": {
+		"php": ">=8.0"
+	},
+	"suggest": {
+		"pw/backend-ui": "Install when your plugin subclass returns true from use_backend_ui() so the license screen uses PW BackendUI. Not required for the legacy .wrap UI."
+	},
+	"autoload": {
+		"psr-4": {
+			"PezWeb\\License\\": "./"
+		},
+		"exclude-from-classmap": [
+			"/views/"
+		]
+	}
+}
