@@ -185,10 +185,13 @@ class Client
 			}
 		}
 
+		// Misma normalización que el servidor (REST usa esc_url_raw en site_url).
+		$site_url = esc_url_raw(home_url());
+
 		// Validar contra servidor
 		$result = $this->api->validate_license(
 			$this->license_key,
-			home_url(),
+			$site_url,
 			static::VALIDATION_HASH,
 		);
 
@@ -202,7 +205,7 @@ class Client
 		}
 
 		// Validar firma HMAC
-		if (!$this->verify_signature($result)) {
+		if (!$this->verify_signature($result, $site_url)) {
 			return false;
 		}
 
@@ -231,21 +234,33 @@ class Client
 	/**
 	 * Verifica firma HMAC del servidor
 	 *
-	 * @param array $response Respuesta del servidor
+	 * Debe coincidir con PZW_License_Generator::generate_signature() en el servidor:
+	 * payload = "true|false|valid_until|site_url|product_id"
+	 *
+	 * @param array  $response Respuesta del servidor
+	 * @param string $site_url Misma URL enviada en validate_license (p. ej. home_url())
 	 * @return bool
 	 */
-	private function verify_signature($response)
+	private function verify_signature($response, $site_url)
 	{
 		if (empty($response["signature"]) || empty($response["valid_until"])) {
 			return false;
 		}
 
-		$valid = $response["valid"] ? "true" : "false";
-		$expected_signature = hash_hmac(
-			"sha256",
-			$valid . $response["valid_until"],
-			static::HMAC_SECRET,
-		);
+		$valid_string = !empty($response["valid"]) ? "true" : "false";
+		$valid_until = (int) $response["valid_until"];
+		$product_id = isset($response["product_id"]) ? (int) $response["product_id"] : 0;
+
+		$payload =
+			$valid_string .
+			"|" .
+			$valid_until .
+			"|" .
+			$site_url .
+			"|" .
+			$product_id;
+
+		$expected_signature = hash_hmac("sha256", $payload, static::HMAC_SECRET);
 
 		return hash_equals($expected_signature, $response["signature"]);
 	}
@@ -440,10 +455,12 @@ class Client
 			);
 		}
 
+		$site_url = esc_url_raw(home_url());
+
 		// Validar contra servidor
 		$result = $this->api->validate_license(
 			$license_key,
-			home_url(),
+			$site_url,
 			static::VALIDATION_HASH,
 		);
 
@@ -452,7 +469,7 @@ class Client
 		}
 
 		// Validar firma
-		if (!$this->verify_signature($result)) {
+		if (!$this->verify_signature($result, $site_url)) {
 			wp_send_json_error(
 				esc_html__(
 					"Invalid server response.",
