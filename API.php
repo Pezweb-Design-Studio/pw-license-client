@@ -143,11 +143,18 @@ class API
 	{
 		$url = $this->build_url($endpoint);
 
+		// WordPress REST API espera JSON en el cuerpo; form-urlencoded a menudo
+		// no rellena get_param() igual en todos los hosts.
+		$headers = [
+			"Accept" => "application/json",
+			"Content-Type" => "application/json; charset=utf-8",
+		];
+
 		$response = wp_remote_post($url, [
 			"timeout" => $this->timeout,
-			"headers" => $this->get_headers(),
+			"headers" => $headers,
 			"user-agent" => $this->get_user_agent(),
-			"body" => $body,
+			"body" => wp_json_encode($body),
 		]);
 
 		return $this->parse_response($response);
@@ -180,7 +187,6 @@ class API
 	{
 		return [
 			"Accept" => "application/json",
-			"Content-Type" => "application/x-www-form-urlencoded",
 		];
 	}
 

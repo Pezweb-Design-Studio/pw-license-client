@@ -251,12 +251,17 @@ class Client
 		$valid_until = (int) $response["valid_until"];
 		$product_id = isset($response["product_id"]) ? (int) $response["product_id"] : 0;
 
+		// Misma cadena que usó el servidor al firmar (evita diferencias esc_url_raw / JSON).
+		$url_in_payload = isset($response["site_url"]) && is_string($response["site_url"])
+			? $response["site_url"]
+			: $site_url;
+
 		$payload =
 			$valid_string .
 			"|" .
 			$valid_until .
 			"|" .
-			$site_url .
+			$url_in_payload .
 			"|" .
 			$product_id;
 
