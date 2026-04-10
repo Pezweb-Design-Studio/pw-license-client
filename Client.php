@@ -232,10 +232,24 @@ class Client
 	}
 
 	/**
+	 * Host canónico para reconstruir el HMAC (debe coincidir con el servidor).
+	 */
+	private static function canonical_site_for_signature($url)
+	{
+		$url = (string) $url;
+		$parsed = parse_url($url);
+		if (!empty($parsed['host'])) {
+			return strtolower($parsed['host']);
+		}
+
+		return strtolower($url);
+	}
+
+	/**
 	 * Verifica firma HMAC del servidor
 	 *
 	 * Debe coincidir con PZW_License_Generator::generate_signature() en el servidor:
-	 * payload = "true|false|valid_until|site_url|product_id"
+	 * payload = "true|false|valid_until|host_canónico|product_id"
 	 *
 	 * @param array  $response Respuesta del servidor
 	 * @param string $site_url Misma URL enviada en validate_license (p. ej. home_url())
@@ -251,10 +265,10 @@ class Client
 		$valid_until = (int) $response["valid_until"];
 		$product_id = isset($response["product_id"]) ? (int) $response["product_id"] : 0;
 
-		// Misma cadena que usó el servidor al firmar (evita diferencias esc_url_raw / JSON).
+		// Misma cadena que usó el servidor al firmar (host canónico; ver PZW canonical_site_for_signature).
 		$url_in_payload = isset($response["site_url"]) && is_string($response["site_url"])
 			? $response["site_url"]
-			: $site_url;
+			: self::canonical_site_for_signature($site_url);
 
 		$payload =
 			$valid_string .
