@@ -55,7 +55,38 @@ class Updater
 
 		add_filter("update_plugins_" . strtolower($host), [$this, "check_update"], 10, 3);
 		add_filter("plugins_api", [$this, "plugin_info"], 20, 3);
+		add_filter("upgrader_source_selection", [$this, "keep_install_folder"], 10, 4);
 		add_action("upgrader_process_complete", [$this, "clear_cache"], 10, 0);
+	}
+
+	/**
+	 * Si la carpeta raíz del zip no se llama como la instalación actual, la
+	 * renombra; si no, WordPress instalaría el plugin en otra carpeta y quedaría
+	 * desactivado.
+	 *
+	 * @param string|\WP_Error $source
+	 * @param string           $remote_source
+	 * @param \WP_Upgrader     $upgrader
+	 * @param array            $hook_extra
+	 * @return string|\WP_Error
+	 */
+	public function keep_install_folder($source, $remote_source, $upgrader, $hook_extra = [])
+	{
+		if (is_wp_error($source) || ($hook_extra["plugin"] ?? "") !== $this->basename) {
+			return $source;
+		}
+
+		$wanted = trailingslashit($remote_source) . dirname($this->basename) . "/";
+		if (untrailingslashit($source) === untrailingslashit($wanted)) {
+			return $source;
+		}
+
+		global $wp_filesystem;
+		if (!$wp_filesystem || !$wp_filesystem->move(untrailingslashit($source), untrailingslashit($wanted), true)) {
+			return new \WP_Error("pzw_rename_failed", "Could not prepare the update package folder.");
+		}
+
+		return $wanted;
 	}
 
 	/**
