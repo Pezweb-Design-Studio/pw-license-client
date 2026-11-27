@@ -52,6 +52,11 @@ class Client
 	private $api;
 
 	/**
+	 * @var Updater|null Actualizaciones automáticas (si el plugin pasó plugin_file)
+	 */
+	private $updater = null;
+
+	/**
 	 * @var string URL del servidor (origen, sin path). Sobrescribible en la subclase.
 	 */
 	protected const SERVER_URL = "https://pezweb.com";
@@ -218,6 +223,17 @@ class Client
 		// Inicializar componentes (sin plugin_slug, usamos validation_hash como identificador)
 		$this->cache = new Cache(static::VALIDATION_HASH);
 		$this->api = new API($this->server_url());
+
+		// Actualizaciones automáticas (opcional): ['plugin_file' => __FILE__ del plugin].
+		if (!empty($config["plugin_file"]) && is_string($config["plugin_file"])) {
+			$this->updater = new Updater(
+				$this->api,
+				static::VALIDATION_HASH,
+				$config["plugin_file"],
+				fn() => $this->license_key,
+			);
+			$this->updater->register();
+		}
 
 		// Registrar hooks
 		$this->register_hooks();
@@ -387,11 +403,56 @@ class Client
 		) {
 			return [
 				"status" => "active",
+				// Próxima revalidación con el servidor (cache firmado).
 				"valid_until" => $cached["valid_until"],
+				// Vencimiento real de la licencia: timestamp, null = de por vida,
+				// o no presente si el servidor es anterior a pw_licence 2.1.
+				"license_expires" => array_key_exists("license_expires", $cached)
+					? ($cached["license_expires"] === null ? null : (int) $cached["license_expires"])
+					: false,
 			];
 		}
 
 		return null;
+	}
+
+	/**
+	 * Texto de vencimiento para la pantalla de licencia.
+	 *
+	 * @param array $license_info Resultado de get_license_info().
+	 * @return array{label:string,hint:string}
+	 */
+	public function expiry_text(array $license_info): array
+	{
+		$d = $this->get_text_domain();
+		$expires = $license_info["license_expires"] ?? false;
+
+		if ($expires === null) {
+			return ["label" => __("Lifetime license", $d), "hint" => ""];
+		}
+
+		if ($expires === false) {
+			// Servidor sin vencimiento en la respuesta: solo se sabe que está vigente.
+			return ["label" => __("License active", $d), "hint" => ""];
+		}
+
+		$label = sprintf(
+			/* translators: %s: expiration date */
+			__("Valid until %s", $d),
+			date_i18n(get_option("date_format"), (int) $expires),
+		);
+
+		$days = (int) ceil(((int) $expires - time()) / DAY_IN_SECONDS);
+		$hint = "";
+		if ($days <= 30) {
+			$hint = sprintf(
+				/* translators: %d: days until the license expires */
+				_n("Expires in %d day", "Expires in %d days", max(0, $days), $d),
+				max(0, $days),
+			);
+		}
+
+		return ["label" => $label, "hint" => $hint];
 	}
 
 	/**
@@ -682,11 +743,13 @@ JS;
 		$this->license_key = $license_key;
 		$this->cache->set("license_data", $result);
 		$this->cache->set("last_validation_attempt", time());
+		if ($this->updater) {
+			$this->updater->clear_cache();
+		}
 
-		$expires_date = date_i18n(
-			get_option("date_format") . " " . get_option("time_format"),
-			$result["valid_until"],
-		);
+		$expires_date = !empty($result["license_expires"])
+			? date_i18n(get_option("date_format"), (int) $result["license_expires"])
+			: "";
 
 		wp_send_json_success([
 			"message" => esc_html__(
@@ -725,6 +788,9 @@ JS;
 		delete_option($this->license_option_name());
 		$this->license_key = "";
 		$this->cache->clear();
+		if ($this->updater) {
+			$this->updater->clear_cache();
+		}
 
 		wp_send_json_success(
 			esc_html__(

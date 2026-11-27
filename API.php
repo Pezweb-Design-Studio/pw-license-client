@@ -72,10 +72,29 @@ class API
 	}
 
 	/**
-	 * Desactiva una licencia en el servidor
+	 * Última versión del plugin y, si la licencia es válida, enlace de descarga firmado.
 	 *
-	 * @param string $license_key License key
-	 * @param string $site_url URL del sitio
+	 * @param string $license_key     License key ('' si no hay)
+	 * @param string $site_url        URL del sitio
+	 * @param string $validation_hash Hash del producto
+	 * @return array|WP_Error
+	 */
+	public function get_update_info($license_key, $site_url, $validation_hash)
+	{
+		$endpoint = "/wp-json/pzw/v1/update/" . rawurlencode((string) $validation_hash);
+
+		return $this->post($endpoint, [
+			"license_key" => $license_key,
+			"site_url" => $site_url,
+		]);
+	}
+
+	/**
+	 * Desactiva una licencia en el servidor (libera la activación del sitio).
+	 *
+	 * @param string $license_key     License key
+	 * @param string $site_url        URL del sitio
+	 * @param string $validation_hash Hash del producto
 	 * @return array|WP_Error
 	 */
 	public function deactivate_license($license_key, $site_url, $validation_hash = "")
