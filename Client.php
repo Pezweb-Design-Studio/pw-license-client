@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Servidor: SERVER_URL (sobrescribible en la subclase) y el filtro
  * `pzw_license_server_url` ($url, $validation_hash) para pruebas locales.
  *
- * @version 2.2.0
+ * @version 2.3.0
  */
 class Client
 {
@@ -247,8 +247,14 @@ class Client
 		// Admin notices
 		add_action("admin_notices", [$this, "show_license_notices"]);
 
-		// Validación periódica
+		// Validación periódica: admin, WP-Cron y respaldo no bloqueante desde el frontend.
 		add_action("admin_init", [$this, "maybe_validate_license"]);
+		add_filter("cron_schedules", [self::class, "add_cron_schedule"]);
+		add_action($this->cron_hook(), [$this, "cron_refresh"]);
+		add_action("init", [$this, "ensure_schedule"]);
+		add_action("init", [$this, "maybe_spawn_refresh"], 99);
+		add_action("wp_ajax_nopriv_" . $this->ajax_action("refresh"), [$this, "ajax_refresh_license"]);
+		add_action("wp_ajax_" . $this->ajax_action("refresh"), [$this, "ajax_refresh_license"]);
 
 		// Settings page
 		add_action("admin_menu", [$this, "add_license_page"], 99);
@@ -268,70 +274,302 @@ class Client
 		]);
 	}
 
+	/*
+	 * Validación resiliente
+	 * ---------------------
+	 * - El estado (última respuesta firmada del servidor + intentos) vive en una
+	 *   opción persistente por plugin; las visitas solo LEEN ese estado, nunca
+	 *   llaman al servidor.
+	 * - Se revalida por cron cada 6 h (+ un evento puntual al vencer valid_until),
+	 *   en el admin si el estado tiene más de 6 h, y, si el cron no corre, con
+	 *   un disparo no bloqueante desde el frontend cuando el estado tiene más
+	 *   de 12 h.
+	 * - Si el servidor no responde (error de red, 5xx, 429, firma inválida), se
+	 *   mantiene la última validación exitosa hasta valid_until + 7 días, sin
+	 *   pasar nunca del vencimiento real de la licencia. Solo una respuesta
+	 *   firmada valid:false la apaga antes.
+	 * - Reintentos con backoff (5 min, 15 min, 1 h, 6 h) y Retry-After.
+	 */
+
+	private const GRACE_PERIOD = 7 * DAY_IN_SECONDS;
+	private const REFRESH_INTERVAL = 6 * HOUR_IN_SECONDS;
+	private const STALE_AFTER = 12 * HOUR_IN_SECONDS;
+	private const MAX_BACKOFF = 6 * HOUR_IN_SECONDS;
+	private const BACKOFF_STEPS = [5 * MINUTE_IN_SECONDS, 15 * MINUTE_IN_SECONDS, HOUR_IN_SECONDS, 6 * HOUR_IN_SECONDS];
+	private const VALIDATION_TIMEOUT = 5;
+
 	/**
-	 * Valida si hay licencia válida
+	 * ¿Hay licencia válida? Lee el estado guardado (sin red).
 	 *
-	 * @param bool $force_check Forzar validación (ignorar cache)
+	 * @param bool $force_check Revalidar ahora contra el servidor (admin/AJAX/cron).
 	 * @return bool
 	 */
 	public function is_valid($force_check = false)
 	{
-		if (empty($this->license_key)) {
+		if ($this->license_key === "") {
 			return false;
 		}
 
-		// Intentar desde cache
-		if (!$force_check) {
-			$cached = $this->cache->get("license_data");
-			if ($cached !== null && $this->is_cache_valid($cached)) {
-				return $cached["valid"] ?? false;
-			}
+		if ($force_check) {
+			$this->refresh(true);
+		}
+
+		return $this->state_allows();
+	}
+
+	/**
+	 * Revalida contra el servidor y actualiza el estado.
+	 *
+	 * @param bool $ignore_backoff true en acciones del usuario (verificar, activar).
+	 * @return bool Licencia válida según el estado resultante.
+	 */
+	public function refresh(bool $ignore_backoff = false): bool
+	{
+		if ($this->license_key === "") {
+			return false;
+		}
+
+		$state = $this->get_state();
+		if (!$ignore_backoff && time() < (int) $state["next_retry_at"]) {
+			return $this->state_allows();
 		}
 
 		// Misma normalización que el servidor (REST usa esc_url_raw en site_url).
 		$site_url = esc_url_raw(home_url());
 
-		// Validar contra servidor
+		$this->api->set_timeout(self::VALIDATION_TIMEOUT);
 		$result = $this->api->validate_license(
 			$this->license_key,
 			$site_url,
 			static::VALIDATION_HASH,
 		);
 
-		if (is_wp_error($result)) {
-			// Si hay error de conexión, usar cache antiguo si existe
-			$old_cache = $this->cache->get("license_data", true);
-			if ($old_cache !== null && $this->is_cache_valid($old_cache)) {
-				return $old_cache["valid"] ?? false;
-			}
-			return false;
+		$state["checked_at"] = time();
+
+		if (is_wp_error($result) || !is_array($result) || !$this->verify_signature($result, $site_url)) {
+			// Sin respuesta firmada: no es un veredicto, se mantiene lo último (gracia) y se reintenta más tarde.
+			$state["failures"] = (int) $state["failures"] + 1;
+			$step = self::BACKOFF_STEPS[min($state["failures"], count(self::BACKOFF_STEPS)) - 1];
+			$retry_after = is_wp_error($result) ? (int) ($result->get_error_data()["retry_after"] ?? 0) : 0;
+			$state["next_retry_at"] = time() + min(self::MAX_BACKOFF, max($step, $retry_after));
+			$this->save_state($state);
+
+			return $this->state_allows();
 		}
 
-		// Validar firma HMAC
-		if (!$this->verify_signature($result, $site_url)) {
-			return false;
+		$state["data"] = $result;
+		$state["site"] = $site_url;
+		$state["last_success_at"] = time();
+		$state["failures"] = 0;
+		$state["next_retry_at"] = 0;
+		$this->save_state($state);
+
+		// Revalidar justo cuando vence la firma (además del cron periódico).
+		if (!empty($result["valid_until"])) {
+			// Un solo evento puntual: reemplaza el anterior.
+			wp_clear_scheduled_hook($this->cron_hook(), ["expiry"]);
+			wp_schedule_single_event((int) $result["valid_until"] + MINUTE_IN_SECONDS, $this->cron_hook(), ["expiry"]);
 		}
 
-		// Guardar en cache
-		$this->cache->set("license_data", $result);
-		$this->cache->set("last_validation_attempt", time());
-
-		return $result["valid"] ?? false;
+		return !empty($result["valid"]);
 	}
 
 	/**
-	 * Verifica si el cache aún es válido según timestamp
-	 *
-	 * @param array $cached_data Datos cacheados
-	 * @return bool
+	 * Evaluación del estado guardado (sin red). La firma se reverifica.
 	 */
-	private function is_cache_valid($cached_data)
+	private function state_allows(): bool
 	{
-		if (empty($cached_data["valid_until"])) {
+		$state = $this->get_state();
+		$data = $state["data"];
+
+		if (!is_array($data) || empty($data["valid"]) || empty($data["valid_until"])) {
 			return false;
 		}
 
-		return time() < $cached_data["valid_until"];
+		if (!$this->verify_signature($data, (string) $state["site"])) {
+			return false;
+		}
+
+		return time() < $this->usable_until($data);
+	}
+
+	/**
+	 * Hasta cuándo sirve una respuesta válida: valid_until + gracia, sin pasar
+	 * del vencimiento real (license_expires; null/ausente = sin tope).
+	 */
+	private function usable_until(array $data): int
+	{
+		$until = (int) $data["valid_until"] + self::GRACE_PERIOD;
+
+		$expires = $data["license_expires"] ?? null;
+		if (is_numeric($expires) && (int) $expires > 0) {
+			$until = min($until, (int) $expires);
+		}
+
+		return $until;
+	}
+
+	/**
+	 * Válida, pero sin confirmación reciente del servidor (pasó valid_until).
+	 */
+	public function in_grace_period(): bool
+	{
+		$data = $this->get_state()["data"];
+
+		return $this->state_allows() && is_array($data) && time() >= (int) $data["valid_until"];
+	}
+
+	private function state_option(): string
+	{
+		return "pzw_license_state_" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	/**
+	 * @return array{data: array|null, site: string, checked_at: int, last_success_at: int, failures: int, next_retry_at: int}
+	 */
+	private function get_state(): array
+	{
+		$defaults = [
+			"data" => null,
+			"site" => "",
+			"checked_at" => 0,
+			"last_success_at" => 0,
+			"failures" => 0,
+			"next_retry_at" => 0,
+		];
+
+		$state = get_option($this->state_option(), null);
+		if (is_array($state)) {
+			return array_merge($defaults, $state);
+		}
+
+		// Migración desde el cache de transients (cliente <= 2.2).
+		$old = $this->cache->get("license_data", true);
+		if (is_array($old)) {
+			$defaults["data"] = $old;
+			$defaults["site"] = esc_url_raw(home_url());
+			$defaults["checked_at"] = (int) ($this->cache->get("last_validation_attempt", true) ?? 0);
+			$defaults["last_success_at"] = $defaults["checked_at"];
+		}
+
+		return $defaults;
+	}
+
+	private function save_state(array $state): void
+	{
+		update_option($this->state_option(), $state, true);
+	}
+
+	private function clear_state(): void
+	{
+		delete_option($this->state_option());
+		$this->cache->clear();
+		wp_unschedule_hook($this->cron_hook());
+	}
+
+	private function cron_hook(): string
+	{
+		return "pzw_license_refresh_" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	/**
+	 * Cron (periódico y puntual).
+	 */
+	public function cron_refresh(): void
+	{
+		$this->refresh();
+	}
+
+	/**
+	 * Programa la revalidación periódica mientras haya clave.
+	 */
+	public function ensure_schedule(): void
+	{
+		if ($this->license_key === "" || wp_next_scheduled($this->cron_hook())) {
+			return;
+		}
+
+		wp_schedule_event(time() + HOUR_IN_SECONDS, "pzw_license_six_hours", $this->cron_hook());
+	}
+
+	/**
+	 * @param array $schedules
+	 * @return array
+	 */
+	public static function add_cron_schedule($schedules)
+	{
+		if (!isset($schedules["pzw_license_six_hours"])) {
+			$schedules["pzw_license_six_hours"] = [
+				"interval" => self::REFRESH_INTERVAL,
+				"display" => "Every 6 hours (PezWeb license)",
+			];
+		}
+
+		return $schedules;
+	}
+
+	/**
+	 * Respaldo si WP-Cron no corre: con el estado viejo (más de 12 h), una visita
+	 * dispara una revalidación no bloqueante. La visita no espera.
+	 */
+	public function maybe_spawn_refresh(): void
+	{
+		if ($this->license_key === "" || is_admin() || wp_doing_ajax() || wp_doing_cron()) {
+			return;
+		}
+
+		if (!$this->refresh_is_due(self::STALE_AFTER) || get_transient($this->spawn_lock()) !== false) {
+			return;
+		}
+
+		set_transient($this->spawn_lock(), 1, 10 * MINUTE_IN_SECONDS);
+
+		wp_remote_post(admin_url("admin-ajax.php"), [
+			"blocking" => false,
+			"timeout" => 0.01,
+			"sslverify" => apply_filters("https_local_ssl_verify", false),
+			"body" => ["action" => $this->ajax_action("refresh")],
+		]);
+	}
+
+	/**
+	 * AJAX público (sin parámetros): solo revalida el estado guardado si
+	 * corresponde. Las comprobaciones van ANTES de llamar al servidor, así no
+	 * sirve para forzar peticiones.
+	 */
+	public function ajax_refresh_license(): void
+	{
+		if ($this->refresh_is_due(self::STALE_AFTER) && get_transient($this->refresh_lock()) === false) {
+			set_transient($this->refresh_lock(), 1, MINUTE_IN_SECONDS);
+			$this->refresh();
+			delete_transient($this->refresh_lock());
+		}
+
+		wp_die("", "", ["response" => 204]);
+	}
+
+	/**
+	 * Toca revalidar: hay clave, el estado es más viejo que $age y no estamos en backoff.
+	 */
+	private function refresh_is_due(int $age): bool
+	{
+		if ($this->license_key === "") {
+			return false;
+		}
+
+		$state = $this->get_state();
+
+		return time() - (int) $state["checked_at"] > $age && time() >= (int) $state["next_retry_at"];
+	}
+
+	private function spawn_lock(): string
+	{
+		return "pzw_license_spawn_" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	private function refresh_lock(): string
+	{
+		return "pzw_license_refreshing_" . sanitize_key(static::VALIDATION_HASH);
 	}
 
 	/**
@@ -394,17 +632,15 @@ class Client
 	 */
 	public function get_license_info()
 	{
-		$cached = $this->cache->get("license_data");
+		$cached = $this->get_state()["data"];
 
-		if (
-			$cached &&
-			$this->is_cache_valid($cached) &&
-			!empty($cached["valid"])
-		) {
+		if (is_array($cached) && $this->state_allows()) {
 			return [
 				"status" => "active",
-				// Próxima revalidación con el servidor (cache firmado).
-				"valid_until" => $cached["valid_until"],
+				// Última confirmación firmada del servidor vigente hasta aquí (luego, gracia).
+				"valid_until" => (int) $cached["valid_until"],
+				"usable_until" => $this->usable_until($cached),
+				"grace" => $this->in_grace_period(),
 				// Vencimiento real de la licencia: timestamp, null = de por vida,
 				// o no presente si el servidor es anterior a pw_licence 2.1.
 				"license_expires" => array_key_exists("license_expires", $cached)
@@ -460,26 +696,10 @@ class Client
 	 */
 	public function maybe_validate_license()
 	{
-		if (!$this->should_validate_now()) {
-			return;
+		// Respeta el backoff: con el servidor caído no frena cada carga del admin.
+		if ($this->refresh_is_due(self::REFRESH_INTERVAL)) {
+			$this->refresh();
 		}
-
-		$this->is_valid(true); // Forzar validación
-	}
-
-	/**
-	 * Determina si debe validar ahora
-	 */
-	private function should_validate_now()
-	{
-		$last_check = $this->cache->get("last_validation_attempt");
-
-		if ($last_check === null) {
-			return true;
-		}
-
-		// Validar máximo cada 6 horas
-		return time() - $last_check > 6 * HOUR_IN_SECONDS;
 	}
 
 	/**
@@ -500,6 +720,24 @@ class Client
 	public function show_license_notices()
 	{
 		if ($this->is_valid()) {
+			if ($this->in_grace_period() && current_user_can("manage_options")) {
+				$state = $this->get_state();
+				echo '<div class="notice notice-warning"><p><strong>' .
+					esc_html($this->get_plugin_name()) .
+					":</strong> ";
+				echo esc_html(
+					sprintf(
+						/* translators: 1: date of the last successful check, 2: date until the license keeps working */
+						__(
+							"The license server could not be reached since %1\$s. The license stays active until %2\$s while we keep retrying.",
+							$this->get_text_domain(),
+						),
+						date_i18n(get_option("date_format"), (int) $state["last_success_at"]),
+						date_i18n(get_option("date_format"), $this->usable_until((array) $state["data"])),
+					),
+				);
+				echo "</p></div>";
+			}
 			return;
 		}
 
@@ -741,8 +979,15 @@ JS;
 		// Guardar licencia (opción propia de este plugin)
 		update_option($this->license_option_name(), $license_key, false);
 		$this->license_key = $license_key;
-		$this->cache->set("license_data", $result);
-		$this->cache->set("last_validation_attempt", time());
+		$this->save_state([
+			"data" => $result,
+			"site" => $site_url,
+			"checked_at" => time(),
+			"last_success_at" => time(),
+			"failures" => 0,
+			"next_retry_at" => 0,
+		]);
+		$this->ensure_schedule();
 		if ($this->updater) {
 			$this->updater->clear_cache();
 		}
@@ -786,8 +1031,9 @@ JS;
 		}
 
 		delete_option($this->license_option_name());
+		delete_option(self::LEGACY_LICENSE_OPTION);
 		$this->license_key = "";
-		$this->cache->clear();
+		$this->clear_state();
 		if ($this->updater) {
 			$this->updater->clear_cache();
 		}

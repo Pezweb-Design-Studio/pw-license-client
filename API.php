@@ -39,6 +39,14 @@ class API
 	}
 
 	/**
+	 * Timeout de las peticiones (segundos).
+	 */
+	public function set_timeout(int $seconds): void
+	{
+		$this->timeout = max(1, $seconds);
+	}
+
+	/**
 	 * Valida una licencia contra el servidor
 	 *
 	 * @param string $license_key License key
@@ -256,12 +264,15 @@ class API
 			);
 		}
 
-		// Manejar errores HTTP
+		// Manejar errores HTTP (status y Retry-After quedan en los datos del error)
 		if ($code >= 400) {
 			return new \WP_Error(
 				$data["code"] ?? "http_error",
 				$data["message"] ?? "Error desconocido del servidor",
-				["status" => $code],
+				[
+					"status" => $code,
+					"retry_after" => (int) wp_remote_retrieve_header($response, "retry-after"),
+				],
 			);
 		}
 
