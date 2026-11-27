@@ -9,7 +9,7 @@ if (! defined("ABSPATH")) {
 
 $d = $this->get_text_domain();
 
-$license_key = get_option("pzw_license_key", "");
+$license_key = $this->get_license_key();
 $is_active = $this->is_valid();
 $license_info = $this->get_license_info();
 ?>
@@ -40,38 +40,13 @@ $license_info = $this->get_license_info();
 			</tr>
 
 			<tr>
-				<th scope="row"><?php esc_html_e("Valid until", $d); ?></th>
+				<th scope="row"><?php esc_html_e("Expiration", $d); ?></th>
 				<td>
 					<?php
-					echo esc_html(
-						date_i18n(
-							get_option("date_format") .
-								" " .
-								get_option("time_format"),
-							$license_info["valid_until"],
-						),
-					);
-
-					$days_until = (int) ceil(
-						($license_info["valid_until"] - time()) / DAY_IN_SECONDS,
-					);
-					if ($days_until <= 30) {
-						echo " ";
-						printf(
-							'<span class="pzw-warning">(%s)</span>',
-							esc_html(
-								sprintf(
-									/* translators: %d: days until revalidation */
-									_n(
-										"Revalidation in %d day",
-										"Revalidation in %d days",
-										$days_until,
-										$d,
-									),
-									$days_until,
-								),
-							),
-						);
+					$expiry = $this->expiry_text($license_info);
+					echo esc_html($expiry["label"]);
+					if ($expiry["hint"] !== "") {
+						printf(' <span class="pzw-warning">(%s)</span>', esc_html($expiry["hint"]));
 					}
 					?>
 				</td>

@@ -36,32 +36,15 @@ if ($is_active && $license_info) {
 				"size" => "md",
 			]);
 			echo "</div>";
-			$date = date_i18n(
-				get_option("date_format") . " " . get_option("time_format"),
-				$license_info["valid_until"],
-			);
+			$expiry = $this->expiry_text($license_info);
 			$ui->paragraph([
-				"text" => esc_html__("Valid until", $d) . ": " . esc_html($date),
+				"text" => esc_html($expiry["label"]),
 				"variant" => "muted",
 				"class" => "pzw-bui-license-valid-until",
 			]);
-			$days_until = (int) ceil(
-				($license_info["valid_until"] - time()) / DAY_IN_SECONDS,
-			);
-			if ($days_until <= 30) {
+			if ($expiry["hint"] !== "") {
 				$ui->paragraph([
-					"text" => esc_html(
-						sprintf(
-							/* translators: %d: days until revalidation */
-							_n(
-								"Revalidation in %d day",
-								"Revalidation in %d days",
-								$days_until,
-								$d,
-							),
-							$days_until,
-						),
-					),
+					"text" => esc_html($expiry["hint"]),
 					"variant" => "default",
 					"class" => "pzw-bui-license-renew-hint",
 				]);
