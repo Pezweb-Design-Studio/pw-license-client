@@ -9,7 +9,7 @@ if (! defined("ABSPATH")) {
 
 $d = $this->get_text_domain();
 
-$license_key = get_option("pzw_license_key", "");
+$license_key = $this->get_license_key();
 $is_active = $this->is_valid();
 $license_info = $this->get_license_info();
 ?>

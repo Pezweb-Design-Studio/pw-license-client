@@ -78,9 +78,10 @@ class API
 	 * @param string $site_url URL del sitio
 	 * @return array|WP_Error
 	 */
-	public function deactivate_license($license_key, $site_url)
+	public function deactivate_license($license_key, $site_url, $validation_hash = "")
 	{
-		$endpoint = "/wp-json/pzw/v1/deactivate";
+		// Ruta del servidor: pzw/v1/licence_deactivation/{hash}.
+		$endpoint = "/wp-json/pzw/v1/licence_deactivation/" . rawurlencode((string) $validation_hash);
 
 		$body = [
 			"license_key" => $license_key,

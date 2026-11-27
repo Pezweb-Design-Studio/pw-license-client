@@ -19,7 +19,15 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Textos: sobrescribe `get_text_domain()` con el text domain del plugin.
  *
- * @version 2.1.0
+ * Varios plugins Pezweb pueden usar este cliente en el mismo sitio: cada
+ * subclase tiene su propia instancia, su propia opción de clave, su propia
+ * página de licencia y sus propias acciones AJAX (todas derivadas de
+ * VALIDATION_HASH).
+ *
+ * Servidor: SERVER_URL (sobrescribible en la subclase) y el filtro
+ * `pzw_license_server_url` ($url, $validation_hash) para pruebas locales.
+ *
+ * @version 2.2.0
  */
 class Client
 {
@@ -44,9 +52,14 @@ class Client
 	private $api;
 
 	/**
-	 * @var string URL del servidor (hardcoded)
+	 * @var string URL del servidor (origen, sin path). Sobrescribible en la subclase.
 	 */
-	private const SERVER_URL = "https://pezweb.com";
+	protected const SERVER_URL = "https://pezweb.com";
+
+	/**
+	 * Opción legacy (cliente <= 2.1) compartida por todos los plugins.
+	 */
+	private const LEGACY_LICENSE_OPTION = "pzw_license_key";
 
 	/**
 	 * FQCN de pw/backend-ui (string) para class_exists sin forzar autoload raro con ::class.
@@ -64,9 +77,9 @@ class Client
 	private const HMAC_SECRET = ""; // Debe ser definido por cada plugin
 
 	/**
-	 * @var self Instancia singleton
+	 * @var array<class-string, self> Una instancia por subclase (un plugin no recibe la de otro).
 	 */
-	protected static $instance = null;
+	private static $instances = [];
 
 	/**
 	 * Text domain for gettext. Override in the plugin subclass (e.g. return 'my-plugin').
@@ -101,10 +114,77 @@ class Client
 	 */
 	public static function init($config = [])
 	{
-		if (static::$instance === null) {
-			static::$instance = new static($config);
+		if (!isset(self::$instances[static::class])) {
+			self::$instances[static::class] = new static($config);
 		}
-		return static::$instance;
+		return self::$instances[static::class];
+	}
+
+	/**
+	 * Instancia ya inicializada de esta subclase, o null.
+	 *
+	 * @return static|null
+	 */
+	public static function instance()
+	{
+		return self::$instances[static::class] ?? null;
+	}
+
+	/**
+	 * URL del servidor de licencias (origen, sin path).
+	 *
+	 * Filtro `pzw_license_server_url`: permite apuntar a un servidor local en
+	 * desarrollo (p. ej. desde un mu-plugin) sin cambiar el código del plugin.
+	 */
+	protected function server_url(): string
+	{
+		return (string) apply_filters(
+			"pzw_license_server_url",
+			static::SERVER_URL,
+			static::VALIDATION_HASH,
+		);
+	}
+
+	/**
+	 * Nombre de la opción donde se guarda la clave de este plugin.
+	 */
+	protected function license_option_name(): string
+	{
+		return "pzw_license_key_" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	/**
+	 * Slug de la pantalla de licencia de este plugin.
+	 */
+	public function license_page_slug(): string
+	{
+		return "pzw-license-" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	/**
+	 * Menú padre de la pantalla de licencia. Sobrescribir para colgarla del
+	 * menú del plugin (p. ej. "mi-plugin-dashboard").
+	 */
+	protected function license_parent_slug(): string
+	{
+		return "options-general.php";
+	}
+
+	/**
+	 * Nombre de una acción AJAX propia de este plugin.
+	 */
+	private function ajax_action(string $name): string
+	{
+		return "pzw_" . $name . "_license_" . sanitize_key(static::VALIDATION_HASH);
+	}
+
+	/**
+	 * Clave guardada para este plugin (la legacy compartida se lee en el
+	 * constructor solo si este plugin todavía no tiene la suya).
+	 */
+	public function get_license_key(): string
+	{
+		return (string) $this->license_key;
 	}
 
 	/**
@@ -130,11 +210,14 @@ class Client
 			);
 		}
 
-		$this->license_key = get_option("pzw_license_key", "");
+		$this->license_key = (string) get_option($this->license_option_name(), "");
+		if ($this->license_key === "") {
+			$this->license_key = (string) get_option(self::LEGACY_LICENSE_OPTION, "");
+		}
 
 		// Inicializar componentes (sin plugin_slug, usamos validation_hash como identificador)
 		$this->cache = new Cache(static::VALIDATION_HASH);
-		$this->api = new API(self::SERVER_URL);
+		$this->api = new API($this->server_url());
 
 		// Registrar hooks
 		$this->register_hooks();
@@ -154,14 +237,18 @@ class Client
 		// Settings page
 		add_action("admin_menu", [$this, "add_license_page"], 99);
 
-		// AJAX handlers
-		add_action("wp_ajax_pzw_activate_license", [
+		// AJAX handlers (acciones propias de este plugin)
+		add_action("wp_ajax_" . $this->ajax_action("activate"), [
 			$this,
 			"ajax_activate_license",
 		]);
-		add_action("wp_ajax_pzw_deactivate_license", [
+		add_action("wp_ajax_" . $this->ajax_action("deactivate"), [
 			$this,
 			"ajax_deactivate_license",
+		]);
+		add_action("wp_ajax_" . $this->ajax_action("check"), [
+			$this,
+			"ajax_check_license",
 		]);
 	}
 
@@ -340,7 +427,10 @@ class Client
 	 */
 	protected function get_license_activate_url(): string
 	{
-		return admin_url("admin.php?page=pzw-license");
+		$parent = $this->license_parent_slug();
+		$base = str_ends_with($parent, ".php") ? $parent : "admin.php";
+
+		return add_query_arg("page", $this->license_page_slug(), admin_url($base));
 	}
 
 	/**
@@ -371,14 +461,95 @@ class Client
 	 */
 	public function add_license_page()
 	{
-		add_submenu_page(
-			"options-general.php",
+		$hook = add_submenu_page(
+			$this->license_parent_slug(),
 			esc_html__("License", $this->get_text_domain()),
 			esc_html__("License", $this->get_text_domain()),
 			"manage_options",
-			"pzw-license",
+			$this->license_page_slug(),
 			[$this, "render_license_page"],
 		);
+
+		if ($hook) {
+			add_action("admin_enqueue_scripts", function ($current) use ($hook) {
+				if ($current === $hook) {
+					$this->enqueue_license_script();
+				}
+			});
+		}
+	}
+
+	/**
+	 * JS de la pantalla de licencia (activar / desactivar / verificar).
+	 * Inline: no depende de dónde quede instalado el paquete dentro de vendor/.
+	 */
+	private function enqueue_license_script(): void
+	{
+		$handle = "pzw-license-" . sanitize_key(static::VALIDATION_HASH);
+		wp_register_script($handle, false, [], "2.2.0", true);
+		wp_enqueue_script($handle);
+
+		$config = [
+			"ajaxUrl" => admin_url("admin-ajax.php"),
+			"nonce" => wp_create_nonce("pzw_license_nonce"),
+			"actions" => [
+				"activate" => $this->ajax_action("activate"),
+				"deactivate" => $this->ajax_action("deactivate"),
+				"check" => $this->ajax_action("check"),
+			],
+			"i18n" => [
+				"working" => __("Working…", $this->get_text_domain()),
+				"error" => __("Could not contact the server. Try again.", $this->get_text_domain()),
+				"confirmDeactivate" => __("Deactivate the license on this site?", $this->get_text_domain()),
+			],
+		];
+
+		$js = <<<'JS'
+(function (cfg) {
+	function msg(text, ok) {
+		var box = document.getElementById("pzw-license-message");
+		if (!box) { return; }
+		box.hidden = false;
+		box.style.display = "";
+		box.className = "pzw-message notice inline " + (ok ? "notice-success" : "notice-error");
+		box.textContent = text;
+	}
+	function call(action, data, btn) {
+		var body = new URLSearchParams(Object.assign({ action: cfg.actions[action], nonce: cfg.nonce }, data || {}));
+		if (btn) { btn.disabled = true; }
+		msg(cfg.i18n.working, true);
+		return fetch(cfg.ajaxUrl, { method: "POST", credentials: "same-origin", body: body })
+			.then(function (r) { return r.json(); })
+			.then(function (res) {
+				var text = res && res.data ? (typeof res.data === "string" ? res.data : res.data.message) : cfg.i18n.error;
+				msg(text || cfg.i18n.error, !!(res && res.success));
+				if (res && res.success) { setTimeout(function () { window.location.reload(); }, 800); }
+			})
+			.catch(function () { msg(cfg.i18n.error, false); })
+			.finally(function () { if (btn) { btn.disabled = false; } });
+	}
+	document.addEventListener("DOMContentLoaded", function () {
+		var form = document.getElementById("pzw-license-form");
+		if (form) {
+			form.addEventListener("submit", function (e) {
+				e.preventDefault();
+				var input = document.getElementById("license_key");
+				call("activate", { license_key: input ? input.value.trim() : "" }, document.getElementById("pzw-activate-license"));
+			});
+		}
+		var off = document.getElementById("pzw-deactivate-license");
+		if (off) {
+			off.addEventListener("click", function () {
+				if (window.confirm(cfg.i18n.confirmDeactivate)) { call("deactivate", {}, off); }
+			});
+		}
+		var chk = document.getElementById("pzw-check-license");
+		if (chk) { chk.addEventListener("click", function () { call("check", {}, chk); }); }
+	});
+})(%s);
+JS;
+
+		wp_add_inline_script($handle, sprintf($js, wp_json_encode($config)));
 	}
 
 	/**
@@ -422,7 +593,7 @@ class Client
 		}
 
 		$domain = $this->get_text_domain();
-		$license_key = get_option("pzw_license_key", "");
+		$license_key = $this->get_license_key();
 		$is_active = $this->is_valid();
 		$license_info = $this->get_license_info();
 		$plugin_name = $this->get_plugin_name();
@@ -506,9 +677,11 @@ class Client
 			);
 		}
 
-		// Guardar licencia
-		update_option("pzw_license_key", $license_key);
+		// Guardar licencia (opción propia de este plugin)
+		update_option($this->license_option_name(), $license_key, false);
+		$this->license_key = $license_key;
 		$this->cache->set("license_data", $result);
+		$this->cache->set("last_validation_attempt", time());
 
 		$expires_date = date_i18n(
 			get_option("date_format") . " " . get_option("time_format"),
@@ -540,12 +713,52 @@ class Client
 			);
 		}
 
-		delete_option("pzw_license_key");
+		// Liberar la activación en el servidor (si falla la red, igual se borra localmente).
+		if ($this->license_key !== "") {
+			$this->api->deactivate_license(
+				$this->license_key,
+				esc_url_raw(home_url()),
+				static::VALIDATION_HASH,
+			);
+		}
+
+		delete_option($this->license_option_name());
+		$this->license_key = "";
 		$this->cache->clear();
 
 		wp_send_json_success(
 			esc_html__(
 				"License deactivated.",
+				$this->get_text_domain(),
+			),
+		);
+	}
+
+	/**
+	 * AJAX: Verificar licencia contra el servidor (ignora cache).
+	 */
+	public function ajax_check_license()
+	{
+		check_ajax_referer("pzw_license_nonce", "nonce");
+
+		if (!current_user_can("manage_options")) {
+			wp_send_json_error(
+				esc_html__(
+					"Insufficient permissions.",
+					$this->get_text_domain(),
+				),
+			);
+		}
+
+		if ($this->is_valid(true)) {
+			wp_send_json_success(
+				esc_html__("License is valid.", $this->get_text_domain()),
+			);
+		}
+
+		wp_send_json_error(
+			esc_html__(
+				"The license is not valid for this site.",
 				$this->get_text_domain(),
 			),
 		);
@@ -626,9 +839,10 @@ class Client
 	 */
 	public static function check($force_check = false)
 	{
-		if (static::$instance === null) {
+		$instance = static::instance();
+		if ($instance === null) {
 			return false;
 		}
-		return static::$instance->is_valid($force_check);
+		return $instance->is_valid($force_check);
 	}
 }
